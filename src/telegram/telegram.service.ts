@@ -69,17 +69,30 @@ export class TelegramService {
   }
 
   async getTokenInfo(ctx: Context) {
-    // 获取token
-    const data = await this.tokenInfoService.getFullTokenInfo(ctx.text);
-    const screen = await this.screenService.getContractScreen(
-      data,
-      ctx.from.id,
-    );
-    const msg = await ctx.replyWithHTML(
-      screen.caption,
-      Markup.inlineKeyboard(screen.inline_keyboards),
-    );
-    await this.messageService.create(ctx.from.id, msg.message_id, ctx.text);
+    try {
+      // 获取token
+      const data = await this.tokenInfoService.getFullTokenInfo(ctx.text);
+      const screen = await this.screenService.getContractScreen(
+        data,
+        ctx.from.id,
+      );
+      const msg = await ctx.replyWithHTML(
+        screen.caption,
+        Markup.inlineKeyboard(screen.inline_keyboards),
+      );
+      await this.messageService.create(ctx.from.id, msg.message_id, ctx.text);
+    } catch (error) {
+      console.error('获取代币信息失败:', error);
+      let errorMessage = '获取代币信息失败';
+
+      if (error.message.includes('Jupiter API')) {
+        errorMessage = '该代币暂不支持交易';
+      } else if (error.message.includes('shyft api')) {
+        errorMessage = '获取代币信息失败，请稍后重试';
+      }
+
+      await ctx.reply(errorMessage);
+    }
   }
 
   async contractRefresh(ctx: Context) {
@@ -100,8 +113,24 @@ export class TelegramService {
   }
 
   private async baseBuy(ctx, userId: number, mint: string, amount: number) {
-    await ctx.reply(`购买${amount}SOL的代币${mint}`);
-    await this.tradeService.trade(userId, amount, mint, true);
+    try {
+      // 先检查代币是否可交易
+      await this.tokenInfoService.getTokenPrice(mint);
+
+      await ctx.reply(`购买${amount}SOL的代币${mint}`);
+      await this.tradeService.trade(userId, amount, mint, true);
+    } catch (error) {
+      console.error('购买失败:', error);
+      let errorMessage = '交易失败，请稍后重试';
+
+      if (error.message.includes('Jupiter API')) {
+        errorMessage = '该代币暂不支持交易';
+      } else if (error.message.includes('余额不足')) {
+        errorMessage = 'SOL余额不足';
+      }
+
+      await ctx.reply(errorMessage);
+    }
   }
 
   async buy(ctx: Context, amount: number) {
@@ -132,8 +161,29 @@ export class TelegramService {
   }
 
   private async baseSell(ctx: Context, id: number, mint: string, amount: any) {
-    await ctx.reply(`卖出${amount}%的${mint}`);
-    await this.tradeService.trade(id, amount, mint, false);
+    try {
+      // 检查输入的比例是否合法
+      const sellPercentage = Number(amount);
+      if (isNaN(sellPercentage) || sellPercentage <= 0) {
+        throw new Error('请输入有效的卖出比例');
+      }
+
+      await ctx.reply(`卖出${amount}%的${mint}`);
+      await this.tradeService.trade(id, amount, mint, false);
+    } catch (error) {
+      console.error('卖出失败:', error);
+      let errorMessage = '交易失败，请稍后重试';
+
+      if (error.message.includes('代币余额不足')) {
+        errorMessage = '代币余额不足';
+      } else if (error.message.includes('交易数量太小')) {
+        errorMessage = '交易数量太小，请增加比例';
+      } else if (error.message.includes('请输入有效的卖出比例')) {
+        errorMessage = '请输入有效的卖出比例';
+      }
+
+      await ctx.reply(errorMessage);
+    }
   }
 
   async sellCustom(ctx: Context) {

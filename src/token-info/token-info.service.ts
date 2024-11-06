@@ -20,20 +20,31 @@ export class TokenInfoService {
   ) {}
 
   async getFullTokenInfo(mint: string) {
-    const tokenInfo = this.getTokenInfo(mint);
-    const tokenPrice = this.getTokenPrice(mint);
-    const isPump = this.pumpFunService.isPump(mint);
+    try {
+      const tokenInfo = this.getTokenInfo(mint);
+      const tokenPrice = this.getTokenPrice(mint);
+      const isPump = this.pumpFunService.isPump(mint);
 
-    const [tokenInfoData, tokenPriceData, isPumpData] = await Promise.all([
-      tokenInfo,
-      tokenPrice,
-      isPump,
-    ]);
-    return {
-      ...tokenInfoData,
-      price: tokenPriceData.data[mint].price,
-      isPump: isPumpData,
-    };
+      const [tokenInfoData, tokenPriceData, isPumpData] = await Promise.all([
+        tokenInfo,
+        tokenPrice,
+        isPump,
+      ]);
+
+      if (!tokenPriceData?.data?.[mint]?.price) {
+        console.error('获取代币价格失败:', mint);
+        throw new Error('获取代币价格失败');
+      }
+
+      return {
+        ...tokenInfoData,
+        price: tokenPriceData.data[mint].price,
+        isPump: isPumpData,
+      };
+    } catch (error) {
+      console.error('获取代币信息失败:', error);
+      throw error;
+    }
   }
 
   async getPumpInfo(mint: string): Promise<PumpFunResponseDto> {
@@ -41,24 +52,32 @@ export class TokenInfoService {
   }
 
   async getTokenPrice(mint: string): Promise<ResponseDto> {
-    const cacheKey = `token_price_${mint}`;
-    const cachedData = await this.redisCacheService.get<ResponseDto>(cacheKey);
-    if (cachedData) {
-      return cachedData;
-    }
-    const response = await fetch(
-      `https://api.jup.ag/price/v2?ids=${mint}&showExtraInfo=true`,
-    );
+    try {
+      const cacheKey = `token_price_${mint}`;
+      const cachedData =
+        await this.redisCacheService.get<ResponseDto>(cacheKey);
+      if (cachedData) {
+        return cachedData;
+      }
 
-    if (response.status === 200) {
-      const data: ResponseDto = await response.json();
-      // await this.cacheManager.set(cacheKey, data);
-      await this.redisCacheService.set(cacheKey, data);
-      return data;
-    } else if (response.status === 500) {
-      throw new Error('Not jupiter token');
-    } else {
-      throw new Error('jupiter api error');
+      console.log('正在获取代币价格:', mint);
+      const response = await fetch(
+        `https://api.jup.ag/price/v2?ids=${mint}&showExtraInfo=true`,
+      );
+
+      console.log('Jupiter API 响应状态:', response.status);
+      if (response.status === 200) {
+        const data: ResponseDto = await response.json();
+        await this.redisCacheService.set(cacheKey, data);
+        return data;
+      } else {
+        const errorText = await response.text();
+        console.error('Jupiter API 错误响应:', errorText);
+        throw new Error(`Jupiter API 错误: ${response.status}`);
+      }
+    } catch (error) {
+      console.error('获取代币价格失败:', error);
+      throw error;
     }
   }
 

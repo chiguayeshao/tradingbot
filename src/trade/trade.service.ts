@@ -92,30 +92,38 @@ export class TradeService {
     quoteResponse: QuoteResponse,
     walletAddress: string,
   ) {
-    const jitoFee = await this.settingService.getJitoFee(userId);
-    const { swapTransaction } = await (
-      await fetch('https://quote-api.jup.ag/v6/swap', {
+    try {
+      const jitoFee = await this.settingService.getJitoFee(userId);
+      const response = await fetch('https://quote-api.jup.ag/v6/swap', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          // quoteResponse from /quote api
           quoteResponse,
           asLegacyTransaction: true,
           prioritizationFeeLamports: {
             jitoTipLamports: jitoFee,
           },
           dynamicComputeUnitLimit: true,
-          // user public key to be used for the swap
           userPublicKey: walletAddress,
-          // auto wrap and unwrap SOL. default is true
           wrapAndUnwrapSol: true,
           skipUserAccountsRpcCalls: false,
         }),
-      })
-    ).json();
-    return swapTransaction;
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Jupiter Swap API 错误:', errorText);
+        throw new Error('获取交易指令失败');
+      }
+
+      const { swapTransaction } = await response.json();
+      return swapTransaction;
+    } catch (error) {
+      console.error('获取交易指令失败:', error);
+      throw error;
+    }
   }
 
   async getBuyInstructions(userId: number, amount: number, mint: string) {
@@ -157,56 +165,89 @@ export class TradeService {
   }
 
   async getSellInstructions(userId: number, rate: number, mint: string) {
-    const wallet = await this.settingService.getWallet(userId);
-    const privateKey = wallet.private_key;
-    const signWallet = Keypair.fromSecretKey(bs58.decode(privateKey));
-    const signer: Signer = {
-      publicKey: signWallet.publicKey,
-      secretKey: signWallet.secretKey,
-    };
-    const slippage = await this.settingService.getSlippage(userId);
-    const totalAmount = await this.solanaService.getTokenBalance(
-      wallet.address,
-      mint,
-    );
-    console.log(totalAmount);
-    const amount = Math.floor((totalAmount * rate) / 100);
-    console.log(amount);
-    const quote = await this.jupiterQuoteApi.quoteGet({
-      inputMint: mint,
-      outputMint: this.NativeSol,
-      amount: amount,
-      slippageBps: slippage * 100,
-    });
-    const outAmount = parseInt(quote.outAmount);
+    try {
+      const wallet = await this.settingService.getWallet(userId);
+      const totalAmount = await this.solanaService.getTokenBalance(
+        wallet.address,
+        mint,
+      );
 
-    const swapTransaction = await this.getSwapTx(userId, quote, wallet.address);
-    await this.createTrade(userId, amount, outAmount, mint, false);
-    const txBuf = Buffer.from(swapTransaction, 'base64');
-    const transaction = Transaction.from(txBuf);
-    const feeInstruction = this.getFeeInstructions(
-      wallet.address,
-      Math.floor(outAmount / 100),
-    );
-    transaction.add(...feeInstruction);
-    transaction.sign(signer);
-    return {
-      transaction,
-      referralBalance: Math.floor((totalAmount / 100) * 0.25),
-    };
+      // 检查余额
+      if (totalAmount <= 0) {
+        throw new Error('代币余额不足');
+      }
+
+      const amount = Math.floor((totalAmount * rate) / 100);
+      // 检查计算后的数量
+      if (amount <= 0) {
+        throw new Error('交易数量太小');
+      }
+
+      console.log('交易数量:', amount);
+
+      const slippage = await this.settingService.getSlippage(userId);
+      const quote = await this.jupiterQuoteApi.quoteGet({
+        inputMint: mint,
+        outputMint: this.NativeSol,
+        amount: amount,
+        slippageBps: slippage * 100,
+      });
+
+      const outAmount = parseInt(quote.outAmount);
+      const swapTransaction = await this.getSwapTx(
+        userId,
+        quote,
+        wallet.address,
+      );
+
+      await this.createTrade(userId, amount, outAmount, mint, false);
+      const txBuf = Buffer.from(swapTransaction, 'base64');
+      const transaction = Transaction.from(txBuf);
+
+      const feeInstruction = this.getFeeInstructions(
+        wallet.address,
+        Math.floor(outAmount / 100),
+      );
+      transaction.add(...feeInstruction);
+
+      // 使用 Keypair 创建 signer
+      const privateKey = bs58.decode(wallet.private_key);
+      const keypair = Keypair.fromSecretKey(privateKey);
+      const signer: Signer = {
+        publicKey: keypair.publicKey,
+        secretKey: keypair.secretKey,
+      };
+
+      transaction.sign(signer);
+      return {
+        transaction,
+        referralBalance: Math.floor((totalAmount / 100) * 0.25),
+      };
+    } catch (error) {
+      console.error('获取卖出指令失败:', error);
+      throw error;
+    }
   }
 
   async trade(userId: number, rateOrSol: number, mint: string, isBuy: boolean) {
-    let res: { transaction: Transaction; referralBalance: number };
-    if (isBuy) {
-      res = await this.getBuyInstructions(userId, rateOrSol, mint);
-    } else {
-      res = await this.getSellInstructions(userId, rateOrSol, mint);
-    }
-    const serializedTx = res.transaction.serialize();
-    const result = await this.jitoService.sendWithJito(serializedTx);
-    console.log(res.referralBalance);
-    if (result.result) {
+    try {
+      let res: { transaction: Transaction; referralBalance: number };
+      if (isBuy) {
+        res = await this.getBuyInstructions(userId, rateOrSol, mint);
+      } else {
+        res = await this.getSellInstructions(userId, rateOrSol, mint);
+      }
+      const serializedTx = res.transaction.serialize();
+      const result = await this.jitoService.sendWithJito(serializedTx);
+      console.log(result, 'result');
+      // 添加交易结果检查
+      if (!result || !result.result) {
+        throw new Error('交易发送失败');
+      }
+
+      console.log(`交易已发送: ${result.result}`);
+
+      // 交易确认后再添加到队列
       this.resultQueue.add(
         'checkTx',
         { txid: result.result, userId, referralBalance: res.referralBalance },
@@ -218,6 +259,11 @@ export class TradeService {
           },
         },
       );
+
+      return result.result;
+    } catch (error) {
+      console.error('交易执行失败:', error);
+      throw new Error(`交易执行失败: ${error.message}`);
     }
   }
 
@@ -243,10 +289,12 @@ export class TradeService {
       wallet.address,
       mint,
     );
-    const currentPositionInSol = await this.getQuotePrice(
-      mint,
-      currentPositionInToken,
-    );
+    let currentPositionInSol = 0;
+    if (currentPositionInToken > 0) {
+      currentPositionInSol = Number(
+        await this.getQuotePrice(mint, currentPositionInToken),
+      );
+    }
     const profit: number = solIn - solOut + Number(currentPositionInSol);
     return Number(profit.toFixed(2));
   }

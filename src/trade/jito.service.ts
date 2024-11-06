@@ -4,31 +4,17 @@ import bs58 from 'bs58';
 @Injectable()
 export class JitoService {
   get JitoEndpoints(): {
-    tokyo: string;
-    amsterdam: string;
-    ny: string;
     mainnet: string;
-    frankfurt: string;
   } {
     return this._JitoEndpoints;
   }
 
-  constructor() {}
-
   private _JitoEndpoints = {
     mainnet: 'https://mainnet.block-engine.jito.wtf/api/v1/transactions',
-    amsterdam:
-      'https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/transactions',
-    frankfurt:
-      'https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions',
-    ny: 'https://ny.mainnet.block-engine.jito.wtf/api/v1/transactions',
-    tokyo: 'https://tokyo.mainnet.block-engine.jito.wtf/api/v1/transactions',
   };
 
   getRandomJitoEndpoint() {
-    const keys = Object.keys(this.JitoEndpoints);
-    const index = Math.floor(Math.random() * keys.length);
-    return this.JitoEndpoints[keys[index]];
+    return this._JitoEndpoints.mainnet;
   }
 
   async sendWithJito(serializedTx: Uint8Array | Buffer | number[]) {
