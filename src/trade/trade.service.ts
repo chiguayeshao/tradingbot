@@ -8,6 +8,7 @@ import {
   SystemProgram,
   Transaction,
   TransactionInstruction,
+  Connection,
 } from '@solana/web3.js';
 import { ConfigService } from '@nestjs/config';
 import bs58 from 'bs58';
@@ -134,14 +135,37 @@ export class TradeService {
       publicKey: signWallet.publicKey,
       secretKey: signWallet.secretKey,
     };
+
     const slippage = await this.settingService.getSlippage(userId);
     const lamports = Math.floor(amount * 10 ** 9);
+
+    // 准备手续费交易
+    const connection = new Connection(
+      'https://mainnet.helius-rpc.com/?api-key=8df1f178-f82a-4bb5-b363-fb1524351fab',
+    );
+    const feeAmount = Math.floor(lamports / 100);
+
+    const feeInstruction = SystemProgram.transfer({
+      fromPubkey: new PublicKey(wallet.address),
+      toPubkey: new PublicKey(this.configService.get('FEE_RECIPIENT_ADDRESS')),
+      lamports: feeAmount,
+    });
+
+    const feeTx = new Transaction();
+    const { blockhash } = await connection.getLatestBlockhash();
+    feeTx.recentBlockhash = blockhash;
+    feeTx.feePayer = new PublicKey(wallet.address);
+    feeTx.add(feeInstruction);
+    feeTx.sign(signer);
+
+    // 准备 swap 交易
     const quote = await this.jupiterQuoteApi.quoteGet({
       inputMint: this.NativeSol,
       outputMint: mint,
       amount: lamports,
       slippageBps: slippage * 100,
     });
+
     await this.createTrade(
       userId,
       Number(quote.outAmount),
@@ -149,18 +173,21 @@ export class TradeService {
       mint,
       true,
     );
+
     const swapTransaction = await this.getSwapTx(userId, quote, wallet.address);
     const txBuf = Buffer.from(swapTransaction, 'base64');
-    const transaction = Transaction.from(txBuf);
-    const feeInstruction = this.getFeeInstructions(
-      wallet.address,
-      Math.floor(lamports / 100),
-    );
-    transaction.add(...feeInstruction);
-    transaction.sign(signer);
+    const swapTx = Transaction.from(txBuf);
+    swapTx.sign(signer);
+
+    // 将两笔交易打包发送
+    const transactions = [feeTx.serialize(), swapTx.serialize()];
+
+    const result = await this.jitoService.sendBundle(transactions);
+
     return {
-      transaction,
-      referralBalance: Math.floor((lamports / 100) * 0.25),
+      transaction: swapTx,
+      referralBalance: Math.floor(feeAmount * 0.25),
+      bundleResult: result,
     };
   }
 
@@ -204,11 +231,25 @@ export class TradeService {
       const txBuf = Buffer.from(swapTransaction, 'base64');
       const transaction = Transaction.from(txBuf);
 
-      const feeInstruction = this.getFeeInstructions(
-        wallet.address,
-        Math.floor(outAmount / 100),
+      // 准备手续费交易
+      const connection = new Connection(
+        'https://mainnet.helius-rpc.com/?api-key=8df1f178-f82a-4bb5-b363-fb1524351fab',
       );
-      transaction.add(...feeInstruction);
+      const feeAmount = Math.floor(outAmount / 100);
+
+      const feeInstruction = SystemProgram.transfer({
+        fromPubkey: new PublicKey(wallet.address),
+        toPubkey: new PublicKey(
+          this.configService.get('FEE_RECIPIENT_ADDRESS'),
+        ),
+        lamports: feeAmount,
+      });
+
+      const feeTx = new Transaction();
+      const { blockhash } = await connection.getLatestBlockhash();
+      feeTx.recentBlockhash = blockhash;
+      feeTx.feePayer = new PublicKey(wallet.address);
+      feeTx.add(feeInstruction);
 
       // 使用 Keypair 创建 signer
       const privateKey = bs58.decode(wallet.private_key);
@@ -218,10 +259,22 @@ export class TradeService {
         secretKey: keypair.secretKey,
       };
 
+      // 签名两笔交易
+      feeTx.sign(signer);
       transaction.sign(signer);
+
+      // 将两笔交易打包发送
+      const transactions = [
+        transaction.serialize(), // 先执行 swap
+        feeTx.serialize(), // 再执行手续费转账
+      ];
+
+      const result = await this.jitoService.sendBundle(transactions);
+
       return {
-        transaction,
+        transaction: transaction,
         referralBalance: Math.floor((totalAmount / 100) * 0.25),
+        bundleResult: result,
       };
     } catch (error) {
       console.error('获取卖出指令失败:', error);
@@ -231,26 +284,52 @@ export class TradeService {
 
   async trade(userId: number, rateOrSol: number, mint: string, isBuy: boolean) {
     try {
-      let res: { transaction: Transaction; referralBalance: number };
+      let res: {
+        transaction: Transaction;
+        referralBalance: number;
+        bundleResult: any;
+      };
       if (isBuy) {
         res = await this.getBuyInstructions(userId, rateOrSol, mint);
       } else {
         res = await this.getSellInstructions(userId, rateOrSol, mint);
       }
-      const serializedTx = res.transaction.serialize();
-      const result = await this.jitoService.sendWithJito(serializedTx);
-      console.log(result, 'result');
-      // 添加交易结果检查
-      if (!result || !result.result) {
-        throw new Error('交易发送失败');
+
+      // 检查 bundle 结果
+      if (!res.bundleResult || res.bundleResult.error) {
+        throw new Error('Bundle 发送失败');
       }
 
-      console.log(`交易已发送: ${result.result}`);
+      console.log('Bundle 发送成功:', res.bundleResult);
 
-      // 交易确认后再添加到队列
+      // 延时 2 秒后再查询 bundle 状态
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+
+      // 获取 bundle 状态
+      const bundleStatus = await this.jitoService.getBundleStatus(
+        res.bundleResult.result,
+      );
+      console.log(bundleStatus, 'bundleStatus');
+
+      // 检查 bundle 状态
+      if (
+        !bundleStatus.result.value ||
+        bundleStatus.result.value.length === 0
+      ) {
+        throw new Error('交易未上链');
+      }
+
+      const transactions = bundleStatus.result.value[0].transactions;
+      const feeTransactionSignature = transactions[1]; // 获取手续费交易的签名
+
+      // 添加到队列进行确认检查
       this.resultQueue.add(
         'checkTx',
-        { txid: result.result, userId, referralBalance: res.referralBalance },
+        {
+          txid: feeTransactionSignature,
+          userId,
+          referralBalance: res.referralBalance,
+        },
         {
           delay: 2000,
           backoff: {
@@ -260,7 +339,7 @@ export class TradeService {
         },
       );
 
-      return result.result;
+      return res.bundleResult.result;
     } catch (error) {
       console.error('交易执行失败:', error);
       throw new Error(`交易执行失败: ${error.message}`);
